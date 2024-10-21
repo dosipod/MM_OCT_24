@@ -447,8 +447,7 @@ uint8_t BusOnOff::getPins(uint8_t* pinArray) const {
   return 1;
 }
 
-
-BusNetwork::BusNetwork(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWhite) {
+BusNetwork::BusNetwork(BusConfig &bc, const ColorOrderMap &com) : Bus(bc.type, bc.start, bc.autoWhite), _colorOrderMap(com) {
   _valid = false;
   USER_PRINT("[");
   switch (bc.type) {
@@ -456,6 +455,11 @@ BusNetwork::BusNetwork(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWhite) {
       _rgbw = false;
       _UDPtype = 2;
       USER_PRINT("NET_ARTNET_RGB");
+      break;
+    case TYPE_NET_ARTNET_RGBW:
+      _rgbw = true;
+      _UDPtype = 2;
+      USER_PRINT("NET_ARTNET_RGBW");
       break;
     case TYPE_NET_E131_RGB:
       _rgbw = false;
@@ -469,31 +473,87 @@ BusNetwork::BusNetwork(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWhite) {
       break;
   }
   _UDPchannels = _rgbw ? 4 : 3;
-  _data = (byte *)malloc(bc.count * _UDPchannels);
+  // #if defined(ARDUINO_ARCH_ESP32) && defined(BOARD_HAS_PSRAM) && defined(WLED_USE_PSRAM)
+  // if (psramFound()){
+  //   _data = (byte*) ps_calloc((bc.count * _UDPchannels)+15, sizeof(byte)); // adding 15 as SIMD math is aligned to 16 units per calculation
+  // } else {
+  //   _data = (byte*) calloc((bc.count * _UDPchannels)+15, sizeof(byte));
+  // }
+  // #else
+  // _data = (byte*) calloc((bc.count * _UDPchannels)+15, sizeof(byte));
+  // #endif
+  _data = (byte*) heap_caps_calloc_prefer((bc.count * _UDPchannels)+15, sizeof(byte), 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+
   if (_data == nullptr) return;
-  memset(_data, 0, bc.count * _UDPchannels);
   _len = bc.count;
+  _colorOrder = bc.colorOrder;
   _client = IPAddress(bc.pins[0],bc.pins[1],bc.pins[2],bc.pins[3]);
   _broadcastLock = false;
   _valid = true;
-  USER_PRINTF(" %u.%u.%u.%u] \n", bc.pins[0],bc.pins[1],bc.pins[2],bc.pins[3]);
+  USER_PRINTF(" %u.%u.%u.%u]\n", bc.pins[0],bc.pins[1],bc.pins[2],bc.pins[3]);
 }
 
-void BusNetwork::setPixelColor(uint16_t pix, uint32_t c) {
+void IRAM_ATTR BusNetwork::setPixelColor(uint16_t pix, uint32_t c) {
   if (!_valid || pix >= _len) return;
-  if (hasWhite()) c = autoWhiteCalc(c);
+  if (_rgbw) c = autoWhiteCalc(c);
   if (_cct >= 1900) c = colorBalanceFromKelvin(_cct, c); //color correction from CCT
   uint16_t offset = pix * _UDPchannels;
-  _data[offset]   = R(c);
-  _data[offset+1] = G(c);
-  _data[offset+2] = B(c);
-  if (_rgbw) _data[offset+3] = W(c);
+  uint8_t co = _colorOrderMap.getPixelColorOrder(pix+_start, _colorOrder);
+  if (_colorOrder != co || _colorOrder != COL_ORDER_RGB) {
+    if (co == COL_ORDER_GRB) {
+      _data[offset]   = G(c);
+      _data[offset+1] = R(c);
+      _data[offset+2] = B(c);     
+    } else if (co == COL_ORDER_RGB) {
+      _data[offset]   = R(c);
+      _data[offset+1] = G(c);
+      _data[offset+2] = B(c);
+    } else if (co == COL_ORDER_BRG) {
+      _data[offset]   = B(c);
+      _data[offset+1] = R(c);
+      _data[offset+2] = G(c);
+    } else if (co == COL_ORDER_RBG) {
+      _data[offset]   = R(c);
+      _data[offset+1] = B(c);
+      _data[offset+2] = G(c);
+    } else if (co == COL_ORDER_GBR) {
+      _data[offset]   = G(c);
+      _data[offset+1] = B(c);
+      _data[offset+2] = R(c);
+    } else if (co == COL_ORDER_BGR) {
+      _data[offset]   = B(c);
+      _data[offset+1] = G(c);
+      _data[offset+2] = R(c);
+    }
+    if (_rgbw) _data[offset+3] = W(c);
+  } else {
+    _data[offset]   = R(c);
+    _data[offset+1] = G(c);
+    _data[offset+2] = B(c);
+    if (_rgbw) _data[offset+3] = W(c);
+  }
 }
 
-uint32_t BusNetwork::getPixelColor(uint16_t pix) const {
+uint32_t IRAM_ATTR BusNetwork::getPixelColor(uint16_t pix) const {
   if (!_valid || pix >= _len) return 0;
   uint16_t offset = pix * _UDPchannels;
-  return RGBW32(_data[offset], _data[offset+1], _data[offset+2], _rgbw ? (_data[offset+3] << 24) : 0);
+  uint8_t co = _colorOrderMap.getPixelColorOrder(pix+_start, _colorOrder);
+  if (_colorOrder != co || _colorOrder != COL_ORDER_RGB) {
+    if (co == COL_ORDER_GRB) {
+      return RGBW32(_data[offset+1], _data[offset+0], _data[offset+2], _rgbw ? (_data[offset+3]) : 0);
+    } else if (co == COL_ORDER_RGB) {
+      return RGBW32(_data[offset+0], _data[offset+1], _data[offset+2], _rgbw ? (_data[offset+3]) : 0);
+    } else if (co == COL_ORDER_BRG) {
+      return RGBW32(_data[offset+2], _data[offset+0], _data[offset+1], _rgbw ? (_data[offset+3]) : 0);
+    } else if (co == COL_ORDER_RBG) {
+      return RGBW32(_data[offset+0], _data[offset+2], _data[offset+1], _rgbw ? (_data[offset+3]) : 0);
+    } else if (co == COL_ORDER_GBR) {
+      return RGBW32(_data[offset+1], _data[offset+2], _data[offset+0], _rgbw ? (_data[offset+3]) : 0);
+    } else if (co == COL_ORDER_BGR) {
+      return RGBW32(_data[offset+2], _data[offset+1], _data[offset+0], _rgbw ? (_data[offset+3]) : 0);
+    }
+  }
+  return RGBW32(_data[offset+0], _data[offset+1], _data[offset+2], _rgbw ? (_data[offset+3]) : 0);
 }
 
 void BusNetwork::show() {
@@ -513,8 +573,8 @@ uint8_t BusNetwork::getPins(uint8_t* pinArray) const {
 void BusNetwork::cleanup() {
   _type = I_NONE;
   _valid = false;
-  if (_data != nullptr) free(_data);
-  _data = nullptr;
+  // if (_data != nullptr) free(_data);
+  // _data = nullptr;
 }
 
 // ***************************************************************************
@@ -591,11 +651,11 @@ BusHub75Matrix::BusHub75Matrix(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWh
   mxconfig.clkphase = false; // can help in case that the leftmost column is invisible, or pixels on the right side "bleeds out" to the left.
  
   // How many panels we have connected, cap at sane value
-  mxconfig.chain_length = max((uint8_t) 1, min(bc.pins[0], (uint8_t) 4)); // prevent bad data preventing boot due to low memory
+  mxconfig.chain_length = max((uint8_t) 1, min(bc.pins[0], (uint8_t) 6)); // prevent bad data preventing boot due to low memory
 
   #if defined(CONFIG_IDF_TARGET_ESP32S3) && defined(BOARD_HAS_PSRAM)
-  if(bc.pins[0] > 4) {
-    USER_PRINTLN("WARNING, chain limited to 4");
+  if(bc.pins[0] > 6) {
+    USER_PRINTLN("WARNING, chain limited to 6");
   }
   # else
   // Disable this check if you are want to try bigger setups and accept you
@@ -676,8 +736,8 @@ BusHub75Matrix::BusHub75Matrix(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWh
 
   USER_PRINTLN("MatrixPanel_I2S_DMA - S3 with PSRAM");
 
-  mxconfig.gpio.r1 =  1;
-  mxconfig.gpio.g1 =  2;
+  mxconfig.gpio.r1 =   1;
+  mxconfig.gpio.g1 =   2;
   mxconfig.gpio.b1 =  42;
   // 4th pin is GND
   mxconfig.gpio.r2 =  41;
@@ -687,10 +747,10 @@ BusHub75Matrix::BusHub75Matrix(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWh
   mxconfig.gpio.a =   45;
   mxconfig.gpio.b =   48;
   mxconfig.gpio.c =   47;
-  mxconfig.gpio.d =   21;
-  mxconfig.gpio.clk = 18;
-  mxconfig.gpio.lat = 8;
-  mxconfig.gpio.oe  = 3;
+  mxconfig.gpio.d =   21;   // this says GND but should be the "D" pin
+  mxconfig.gpio.clk = 20;
+  mxconfig.gpio.lat = 19;
+  mxconfig.gpio.oe  =  8;   // don't use GPIO0 or it might hold board in download mode
   // 16th pin is GND
 
 #elif defined(CONFIG_IDF_TARGET_ESP32S3) // ESP32-S3
@@ -771,6 +831,14 @@ BusHub75Matrix::BusHub75Matrix(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWh
   mxconfig.gpio.d = 21;
   mxconfig.gpio.e = 12;
 
+  // mxconfig.double_buff = true; // <------------- Turn on double buffer
+  // mxconfig.driver = HUB75_I2S_CFG::ICN2038S;  // experimental - use specific shift register driver
+  //mxconfig.latch_blanking = 3;
+  // mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_10M;  // experimental - 5MHZ should be enugh, but colours looks slightly better at 10MHz
+  //mxconfig.min_refresh_rate = 90;
+  //mxconfig.min_refresh_rate = 120;
+  // mxconfig.clkphase = false;  // can help in case that the leftmost column is invisible, or pixels on the right side "bleeds out" to the left.
+
 #else
   USER_PRINTLN("MatrixPanel_I2S_DMA - Default pins");
   /*
@@ -800,6 +868,15 @@ BusHub75Matrix::BusHub75Matrix(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWh
   mxconfig.gpio.e = 18;
 
 #endif
+
+  #ifndef PIXEL_COLOR_DEPTH_BIT
+    #define PIXEL_COLOR_DEPTH_BIT 8
+  #endif
+
+  mxconfig.setPixelColorDepthBits(PIXEL_COLOR_DEPTH_BIT);
+  mxconfig.double_buff = false; // default to off, known to cause issue with some effects but needs more memory
+  mxconfig.clkphase = false;
+  mxconfig.chain_length = max((u_int8_t) 1, min(bc.pins[0], (u_int8_t) 6)); // prevent bad data preventing boot due to low memory
 
   USER_PRINTF("MatrixPanel_I2S_DMA config - %ux%u (type %u) length: %u, %u bits/pixel.\n", mxconfig.mx_width, mxconfig.mx_height, bc.type, mxconfig.chain_length, mxconfig.getPixelColorDepthBits() * 3);
   DEBUG_PRINT(F("Free heap: ")); DEBUG_PRINTLN(ESP.getFreeHeap()); lastHeap = ESP.getFreeHeap();
@@ -850,6 +927,8 @@ BusHub75Matrix::BusHub75Matrix(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWh
       USER_PRINT(F("heap usage: ")); USER_PRINTLN(int(lastHeap - ESP.getFreeHeap()));
       return;
   }
+  // virtualDisp = new VirtualMatrixPanel((*dma_display), NUM_ROWS, NUM_COLS, PANEL_RES_X, PANEL_RES_Y, VIRTUAL_MATRIX_CHAIN_TYPE); 
+  display = new VirtualMatrixPanel((*realdisplay), 2, 3, 64, 64, CHAIN_BOTTOM_RIGHT_UP );
 
   this->_len = (display->width() * display->height());
 
@@ -892,9 +971,11 @@ BusHub75Matrix::BusHub75Matrix(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWh
     
     USER_PRINT(F("heap usage: ")); USER_PRINTLN(int(lastHeap - ESP.getFreeHeap()));
     delay(18);   // experiment - give the driver a moment (~ one full frame @ 60hz) to settle
+    // let's adjust default brightness
+    realdisplay->setBrightness8(25);    // range is 0-255, 0 - 0%, 255 - 100%
+    _bri = 25;
     _valid = true;
     display->clearScreen();   // initially clear the screen buffer
-    USER_PRINTLN("MatrixPanel_I2S_DMA clear ok");
 
     if (_ledBuffer) free(_ledBuffer);                 // should not happen
     if (_ledsDirty) free(_ledsDirty);                 // should not happen
@@ -1151,7 +1232,7 @@ int BusManager::add(BusConfig &bc) {
   if (getNumBusses() - getNumVirtualBusses() >= WLED_MAX_BUSSES) return -1;
   DEBUG_PRINTF("BusManager::add(bc.type=%u)\n", bc.type);
   if (bc.type >= TYPE_NET_DDP_RGB && bc.type < 96) {
-    busses[numBusses] = new BusNetwork(bc);
+    busses[numBusses] = new BusNetwork(bc, colorOrderMap);
   } else if (bc.type >= TYPE_HUB75MATRIX && bc.type <= (TYPE_HUB75MATRIX + 10)) {
 #ifdef WLED_ENABLE_HUB75MATRIX
     DEBUG_PRINTLN("BusManager::add - Adding BusHub75Matrix");
